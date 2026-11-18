@@ -36,6 +36,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
+	"github.com/kuasar-sandbox/orchestrator/internal/perfmark"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -327,6 +328,8 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 	if sb.InstanceID == "" {
 		sb.InstanceID = uuid.NewString()
 	}
+	p := perfmark.Start("orch", "create-admission").SID(sb.ID)
+	p.Mark("admission.begin")
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -344,10 +347,12 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	tPrep := time.Now()
 	preparation, err := o.prepareSandboxLaunch(ctx, sb, tmpl)
 	if err != nil {
 		return nil, nil, err
 	}
+	p.Dur("admission.launch_preflight", tPrep)
 
 	barrierStarted := time.Now()
 	if o.routeBarriers == nil {
@@ -373,6 +378,7 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 
 	unlock := o.lifecycle.Lock(sb.ID)
 	defer unlock()
+	tInsert := time.Now()
 	attempt, err := o.launches.Claim(lifecycleCtx, sb.ID, launchCreate)
 	if err != nil {
 		return nil, nil, err
@@ -391,10 +397,13 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 		return nil, nil, err
 	}
 	attempt.SetAcceptedAt(time.Now())
+	p.Dur("admission.claim_insert", tInsert)
+	tPublish := time.Now()
 	initial := cloneSandbox(sb)
 	o.cache(initial)
 	o.publishUpsert(initial)
 	o.observeSandboxUpsert(initial)
+	p.Dur("admission.publish", tPublish)
 	barrierStarted = time.Now()
 	o.publishRouteBarrier(barrier.ID())
 	// The barrier is bounded by proxy policy, caller cancellation, and node
@@ -416,6 +425,7 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 		}
 	}
 	o.logProxyRouteBarrier(sb.ID, barrierErr, time.Since(barrierStarted))
+	p.Dur("admission.route_barrier", barrierStarted)
 	if barrierErr != nil {
 		admissionErr := errors.Join(api.ErrProxyUnavailable, barrierErr)
 		rollbackErr := o.rollbackPreLaunchAdmission(sb.ID)
@@ -424,6 +434,7 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 		return nil, nil, terminalErr
 	}
 	work := cloneSandbox(sb)
+	p.Mark("admission.end")
 	o.launches.Start(attempt, func(launchCtx context.Context, current *launchAttempt) error {
 		return o.runLaunch(launchCtx, current, work, tmpl, preparation)
 	})
@@ -537,7 +548,13 @@ func (o *Orchestrator) logLaunchPhase(attempt *launchAttempt, sb *types.Sandbox,
 }
 
 func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID, preparation *launchPreparation) error {
+	p := perfmark.Start("orch", string(attempt.Kind())).SID(sb.ID)
+	if acceptedAt := attempt.AcceptedAt(); !acceptedAt.IsZero() {
+		p.MarkKV("orch.launch.dispatch", map[string]any{"delay_ms": float64(time.Since(acceptedAt)) / 1e6})
+	}
+	p.Mark("orch.launch.enter")
 	err := o.launchSandbox(ctx, attempt, sb, tmpl, preparation)
+	p.Mark("orch.launch.exit")
 	result := "success"
 	failureStage := ""
 	if err != nil {
@@ -1472,6 +1489,8 @@ func validateCaptureRequest(request sandboxcfg.CaptureRequest) error {
 }
 
 func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox, request sandboxcfg.CaptureRequest, beforeCapture ...func() error) (string, error) {
+	p := perfmark.Start("orch", "pause").SID(sb.ID).Run(sb.RunID)
+	p.Mark("orch.pause.begin")
 	if sb.State == types.StatePaused {
 		return "", api.ErrAlreadyPaused
 	}
@@ -1490,15 +1509,20 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 			return "", api.ErrCheckpointLimit
 		}
 	}
+	p.Mark("orch.pause.admission")
+	tSource := time.Now()
 	ctx, release, err := o.trySourceOperation(ctx, sb)
 	if err != nil {
 		return "", err
 	}
+	p.Dur("orch.pause.sourceop", tSource)
 	defer release()
+	tOp := time.Now()
 	opCtx, finish, err := o.beginPauseOperation(ctx)
 	if err != nil {
 		return "", err
 	}
+	p.Dur("orch.pause.op", tOp)
 	defer finish()
 	o.log.Info("pause capture resolved",
 		"sid", sb.ID,
@@ -1506,20 +1530,25 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		"mode", o.cfg.Checkpoint.Mode,
 		"merge_ref", checkpointPolicyValue(request.SnapshotPolicy.MergeRef),
 		"drop_caches", checkpointPolicyValue(request.SnapshotPolicy.DropCaches))
+	tPrepare := time.Now()
 	if err := o.preparePause(opCtx, sb, request, beforeCapture...); err != nil {
 		return "", err
 	}
+	p.Dur("orch.pause.barrier", tPrepare)
 	captureStarted := time.Now()
 	result, err := o.capture(opCtx, sb, request)
 	o.log.Info("pause capture completed", "sid", sb.ID, "capture_ms", float64(time.Since(captureStarted))/1e6, "err", err)
+	p.Dur("orch.pause.capture", captureStarted)
 	if err != nil {
 		o.rollbackPause(opCtx, sb)
 		return "", err
 	}
+	tCommit := time.Now()
 	changed, err := o.st.CommitPaused(opCtx, sb.ID, sb.RunID, result.Source, result.CheckpointID)
 	if err != nil {
 		return "", fmt.Errorf("orch: commit pause %s: %w", sb.ID, err)
 	}
+	p.Dur("orch.pause.commit", tCommit)
 	if !changed {
 		return "", fmt.Errorf("orch: commit pause %s: running sandbox is no longer owned by runner %s", sb.ID, sb.RunID)
 	}
@@ -1535,6 +1564,7 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(opCtx), 30*time.Second)
 	defer cancel()
+	cleanupStarted := time.Now()
 	if err := o.cleanupPausedOwnership(cleanupCtx, paused); err != nil {
 		// Capture and the paused transition are already committed. Retain every
 		// uncleared exact ownership field for admission/restart reconciliation;
@@ -1542,9 +1572,13 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		o.log.Warn("pause: ownership cleanup incomplete", "sid", paused.ID, "err", err)
 		o.startPausedCleanupRetry(paused.ID)
 	}
+	p.Dur("orch.pause.cleanup", cleanupStarted)
+	tPublish := time.Now()
 	o.cache(paused)
 	o.publishUpsert(paused) // proxies keep the (now paused) route so traffic triggers a Wake
 	o.observeSandboxUpsert(paused)
+	p.Dur("orch.pause.publish", tPublish)
+	p.Mark("orch.pause.end")
 	return result.CheckpointID, nil
 }
 
@@ -1567,10 +1601,13 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 		return err
 	}
 	defer release()
+	p := perfmark.Start("orch", "pause-cleanup").SID(sb.ID)
 	if runID := sb.RunID; runID != "" {
+		tFence := time.Now()
 		if err := o.fenceSandboxRunner(ctx, runID); err != nil {
 			return err
 		}
+		p.Dur("cleanup.fence", tFence)
 		changed, err := o.st.ClearPausedRunner(ctx, sb.ID, runID)
 		if err != nil {
 			return err
@@ -1582,6 +1619,7 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 		sb.RunID = ""
 	}
 	if port := sb.VswitchPort; port != "" {
+		tDetach := time.Now()
 		o.networkAllocationMu.Lock()
 		detachErr := o.vs.Detach(ctx, port)
 		if detachErr != nil && !errors.Is(detachErr, vswitch.ErrPortNotAttached) {
@@ -1597,6 +1635,7 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 			delete(o.detachedPortsPending, port)
 		}
 		o.networkAllocationMu.Unlock()
+		p.Dur("cleanup.detach", tDetach)
 		if err != nil {
 			return err
 		}
@@ -1610,9 +1649,12 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 		removeRunDir = os.RemoveAll
 	}
 	if runDir := sb.RunDir; runDir != "" {
+		tCkpt := time.Now()
 		if err := o.cleanupCheckpoint(ctx, sb); err != nil {
 			return err
 		}
+		p.Dur("cleanup.checkpoint", tCkpt)
+		tRm := time.Now()
 		if err := removeRunDir(runDir); err != nil {
 			return fmt.Errorf("remove paused sandbox RunDir %s: %w", runDir, err)
 		}
@@ -1620,6 +1662,7 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 		if err != nil {
 			return err
 		}
+		p.Dur("cleanup.rundir", tRm)
 		if !changed {
 			return fmt.Errorf("orch: paused RunDir ownership changed for %s", sb.ID)
 		}
