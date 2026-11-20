@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/childenv"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
@@ -20,6 +21,11 @@ func (o *Orchestrator) cleanupCheckpoint(ctx context.Context, sb *types.Sandbox)
 	_, err := o.inspectOrCleanupCheckpoint(ctx, sb, false)
 	return err
 }
+
+// checkpointHelperGOMAXPROCS caps the cleanup helper's scheduler width. It is a
+// fresh Go process on pause's critical path; scope the cap to that child rather
+// than the conductor's own runtime (see childenv.GOMAXPROCS).
+const checkpointHelperGOMAXPROCS = "4"
 
 func (o *Orchestrator) inspectOrCleanupCheckpoint(ctx context.Context, sb *types.Sandbox, inspect bool) ([]artifact.DiffCheckpointRef, error) {
 	source := sb.ResumeSource
@@ -80,7 +86,7 @@ func (o *Orchestrator) inspectOrCleanupCheckpoint(ctx context.Context, sb *types
 	}
 	cmd := exec.CommandContext(ctx, o.executables.OrchestratorCtl(), args...)
 	inheritSourceOperation(ctx, cmd)
-	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+sb.ManifestKey)
+	cmd.Env = append(childenv.GOMAXPROCS(os.Environ(), checkpointHelperGOMAXPROCS), "MANIFEST_KEY="+sb.ManifestKey)
 	var stderr, stdout bytes.Buffer
 	cmd.Stderr = &stderr
 	cmd.Stdout = &stdout
