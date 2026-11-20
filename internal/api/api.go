@@ -439,6 +439,18 @@ type Core interface {
 	ImportSandbox(ctx context.Context, apiKey, token, targetID string, options ImportOptions) (string, error)
 }
 
+// sandboxCreateWaiter is implemented by standalone cores that can block until
+// a just-accepted create leaves "starting". It is optional so cluster routers
+// keep the asynchronous create contract.
+type sandboxCreateWaiter interface {
+	WaitSandboxStarted(ctx context.Context, id string) (*types.Sandbox, error)
+}
+
+// createWaitLimit bounds how long POST /sandboxes holds the request. A slower
+// create falls back to returning the "starting" row, preserving the old
+// asynchronous contract.
+const createWaitLimit = 60 * time.Second
+
 // ConnectMMDSCore is the standalone-only extension for migration-time initial
 // MMDS secrets. Cluster router implementations intentionally do not implement
 // it, so no CONNECT config is added to node-link or cluster command schemas.
@@ -620,6 +632,22 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	// The standalone core launches asynchronously; block until the sandbox
+	// leaves "starting" so clients do not have to poll (the SDK otherwise
+	// quantizes create latency to its poll interval). Cluster cores without
+	// the waiter keep the asynchronous contract.
+	if waiter, ok := a.core.(sandboxCreateWaiter); ok {
+		waitCtx, cancel := context.WithTimeout(r.Context(), createWaitLimit)
+		final, waitErr := waiter.WaitSandboxStarted(waitCtx, sb.ID)
+		cancel()
+		if waitErr == nil && final != nil {
+			sb = final
+		}
+		if sb.State == types.StateDead {
+			writeErr(w, http.StatusInternalServerError, "sandbox failed to start")
+			return
+		}
+	}
 	p.SID(sb.ID).Mark("api.response")
 	writeJSON(w, 201, a.sandboxResp(sb))
 }
@@ -739,6 +767,20 @@ func (a *API) connect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.Dur("api.core", tCore)
+	// Resume/import is asynchronous on the standalone core for the same reason
+	// as create; wait for the row to leave "starting" so clients do not poll.
+	if waiter, ok := a.core.(sandboxCreateWaiter); ok && sb != nil && sb.State == types.StateStarting {
+		waitCtx, cancel := context.WithTimeout(r.Context(), createWaitLimit)
+		final, waitErr := waiter.WaitSandboxStarted(waitCtx, sb.ID)
+		cancel()
+		if waitErr == nil && final != nil {
+			sb = final
+		}
+		if sb.State == types.StateDead {
+			writeErr(w, http.StatusInternalServerError, "sandbox failed to start")
+			return
+		}
+	}
 	p.Mark("api.response")
 	writeJSON(w, 200, a.sandboxResp(sb))
 }

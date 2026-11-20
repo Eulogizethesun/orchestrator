@@ -96,6 +96,29 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	return cloneSandbox(accepted), nil
 }
 
+// WaitSandboxStarted blocks until a just-accepted create leaves the starting
+// state (running or dead) or ctx ends. The launch stays asynchronous: when ctx
+// ends first the current row is returned, so the API can keep the old contract.
+func (o *Orchestrator) WaitSandboxStarted(ctx context.Context, id string) (*types.Sandbox, error) {
+	if attempt, ok := o.launches.Lookup(id); ok {
+		_ = attempt.wait(ctx)
+	}
+	for {
+		sb, err := o.st.Get(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if sb == nil || sb.State != types.StateStarting {
+			return sb, nil
+		}
+		select {
+		case <-ctx.Done():
+			return sb, nil
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
 // normalizeSandboxCreateDefinition retains the direct API's template aliases
 // and MMDS input boundary. Cluster commands keep their canonical template and
 // trusted context, but share normalizeSandboxCreateConfig below.
