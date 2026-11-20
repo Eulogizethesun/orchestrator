@@ -20,6 +20,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/childenv"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/nocgroup"
 	"github.com/kuasar-sandbox/orchestrator/internal/perfmark"
@@ -27,6 +28,13 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
+
+// sandboxRuntimeGOMAXPROCS caps the per-sandbox runtime's Go scheduler width.
+// One sandbox-ctl owns one VM control socket, one UFFD handler and one guest
+// link, so a few Ps are plenty. Left at the default (NumCPU), Go initializes
+// per-P state for every core before main — ~15-20ms per exec on high-core
+// nodes — and create/resume pays that on every launch.
+const sandboxRuntimeGOMAXPROCS = "4"
 
 // launchTask fetches the already-authenticated exact-run bootstrap, performs
 // optional task-local artifact preparation, and starts the sandbox-ctl child.
@@ -188,6 +196,10 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	argv = appendRefLocationArgs(argv, locations)
 	authoritativeEnv := mergeAuthoritativeEnv(spec.Env, bootstrap.Env)
 	env := taskEnv(authoritativeEnv)
+	// sandbox-ctl is a short-lived, I/O-bound Go runtime; cap its scheduler
+	// width so Go's per-core initialization does not tax every exec. Scoped to
+	// this child: the runner and conductor keep their own GOMAXPROCS.
+	env = childenv.GOMAXPROCS(env, sandboxRuntimeGOMAXPROCS)
 	// Preparation cancellation must not become the runtime lifetime. The
 	// sole spawn boundary derives child FD numbers and owns readiness Close.
 	cancelDeadline()
