@@ -42,6 +42,7 @@ func TestGeneratedUnitsUseRunIDAssignment(t *testing.T) {
 	requireCollectModeInUnitSection(t, "runner", runner)
 	for _, want := range []string{
 		"WorkingDirectory=/run/kuasar-test",
+		"Environment=GOMAXPROCS=4",
 		"run-sandbox --pidfile=/run/kuasar-test/runners/%i.pid",
 		"--run-id=%i",
 		"ExecStopPost=/bin/rm -f /run/kuasar-test/runners/%i.pid",
@@ -75,6 +76,9 @@ func TestGeneratedUnitsUseRunIDAssignment(t *testing.T) {
 	}
 	if !strings.Contains(builder, "Slice=sandbox-builder.slice") || !strings.Contains(builder, "Delegate=yes") {
 		t.Fatalf("builder unit lost delegated aggregate-slice placement:\n%s", builder)
+	}
+	if strings.Contains(builder, "GOMAXPROCS=") {
+		t.Fatalf("builder unit must keep the default scheduler width:\n%s", builder)
 	}
 }
 
