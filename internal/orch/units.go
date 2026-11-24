@@ -13,6 +13,15 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 )
 
+// runnerGOMAXPROCS caps the resident runner's Go scheduler width. A runner is a
+// single-sandbox, I/O-bound supervisor: it waits on the config socket, spawns
+// one sandbox-ctl child, and reports its result. On a many-core node the
+// default width makes every cold unit pay the per-P runtime init before it can
+// accept an assignment, and keeps 384-P runtime structures resident for every
+// idle runner. An operator drop-in that sets GOMAXPROCS still wins, because
+// later Environment= entries override earlier ones.
+const runnerGOMAXPROCS = "4"
+
 // InstallUnits generates and installs the systemd template units (+ slices)
 // node-ctl drives, then daemon-reloads if anything changed. When
 // units.install=false, the operator manages unit files out of band and this
@@ -151,13 +160,17 @@ CollectMode=inactive-or-failed
 
 [Service]
 Type=exec
+# A runner serves one sandbox and is almost entirely I/O-bound. Cap its
+# scheduler width so a cold unit does not pay per-core runtime init and idle
+# runners do not keep 384-P runtime structures resident.
+Environment=GOMAXPROCS=%s
 WorkingDirectory=%s
 ExecStart=%s run-sandbox --pidfile=%s --config-socket=%s --run-id=%%i
 ExecStopPost=/bin/rm -f %s
 # One resident node-ctl parent owns one direct sandbox-ctl child per assignment; runtime child exit is terminal for that exact run.
 Restart=no
 KillMode=control-group
-%s`, o.cfg.Paths.RunRoot, o.executables.OrchestratorCtl(), nodepath.RunnerPID(o.cfg.Paths.RunRoot, "%i"), o.cfg.Paths.ConfigSocket, nodepath.RunnerPID(o.cfg.Paths.RunRoot, "%i"), stopBlock)
+%s`, runnerGOMAXPROCS, o.cfg.Paths.RunRoot, o.executables.OrchestratorCtl(), nodepath.RunnerPID(o.cfg.Paths.RunRoot, "%i"), o.cfg.Paths.ConfigSocket, nodepath.RunnerPID(o.cfg.Paths.RunRoot, "%i"), stopBlock)
 }
 
 func (o *Orchestrator) builderUnitFile() string {
