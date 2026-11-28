@@ -1569,23 +1569,32 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		paused.PauseReason = types.PauseReasonExplicit
 	}
 
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(opCtx), 30*time.Second)
-	defer cancel()
-	cleanupStarted := time.Now()
-	if err := o.cleanupPausedOwnership(cleanupCtx, paused); err != nil {
-		// Capture and the paused transition are already committed. Retain every
-		// uncleared exact ownership field for admission/restart reconciliation;
-		// returning a cleanup error here would misleadingly invite a second Pause.
-		o.log.Warn("pause: ownership cleanup incomplete", "sid", paused.ID, "err", err)
-		o.startPausedCleanupRetry(paused.ID)
-	}
-	p.Dur("orch.pause.cleanup", cleanupStarted)
+	// Ownership cleanup no longer blocks the response: capture and the paused
+	// transition are already committed above. The paused row keeps its exact
+	// RunID/port/RunDir fields, so pausedCleanupPending marks the in-flight
+	// cleanup for every consumer of the established route protocol. The
+	// coalesced worker (startPausedCleanupRetry) fences the runner under the
+	// same per-sandbox lifecycle lock used by Resume/Delete — a same-ID
+	// Connect/Delete still cannot observe an unfenced runner — and releases
+	// ownership stepwise, persisting and publishing each cleared field
+	// (recordPausedCleanupProgress). Failures retain the durable paused owner
+	// for retry/reconciliation, exactly like the former synchronous fallback:
+	// the old "cleanup failed" path and this default path are now the same
+	// mechanism, so the pause answer carries the capture result instead of
+	// waiting ~100ms for runner teardown to drain behind the fence.
 	tPublish := time.Now()
 	o.cache(paused)
 	o.publishUpsert(paused) // proxies keep the (now paused) route so traffic triggers a Wake
 	o.observeSandboxUpsert(paused)
 	p.Dur("orch.pause.publish", tPublish)
+	// Port note (mytest lineage): the synchronous cleanup this used to run also
+	// carried the orch.pause.cleanup mark. That mark is retired with the
+	// blocking wait it measured; teardown stays instrumented by the worker's
+	// own pause-cleanup session (cleanup.fence/detach/checkpoint/rundir).
 	p.Mark("orch.pause.end")
+	if pausedCleanupPending(paused) {
+		o.startPausedCleanupRetry(paused.ID)
+	}
 	return result.CheckpointID, nil
 }
 
