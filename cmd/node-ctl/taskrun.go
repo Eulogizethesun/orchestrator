@@ -26,6 +26,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/perfmark"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxproc"
 	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
+	"github.com/kuasar-sandbox/orchestrator/internal/trustprepare"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -189,6 +190,13 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 			argv = append(argv, "--from", preparedSource.Ref)
 		case types.ResumeSourceSnapshot:
 			argv = append(argv, "--restore", preparedSource.Ref)
+			// The prepare pass ran in this same node process and validated
+			// the exact immutable artifacts; the flag lets the runtime skip
+			// only re-verification (never parsing or file opens). Off unless
+			// KUASAR_TRUST_PREPARE=1.
+			if trustprepare.Enabled() {
+				argv = append(argv, "--trust-prepare")
+			}
 		default:
 			return fmt.Errorf("task prepared unsupported source kind %q", preparedSource.Kind)
 		}
