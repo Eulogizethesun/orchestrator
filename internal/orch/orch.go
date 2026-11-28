@@ -82,6 +82,12 @@ type Orchestrator struct {
 	mu  sync.Mutex
 	reg map[string]*types.Sandbox // in-memory immutable snapshots (hot path: Route/LaunchSpecFor)
 
+	// envdInitFP is a process-local hint: sandbox id -> fingerprint of the
+	// envd /init payload last successfully applied. A missing entry (conductor
+	// restart, cache eviction, new identity) forces a conservative /init.
+	envdInitMu sync.Mutex
+	envdInitFP map[string]string
+
 	launches          launchGroup            // sole process-local owner of create and resume attempts
 	acceptedOps       acceptedOperationGroup // accepted pauses/exports drain before shared dependencies close
 	buildWake         chan struct{}
@@ -241,6 +247,7 @@ func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs v
 		pauseBarriers:        configsock.NewRegistry(),
 		sandboxReadyTimeout:  0,
 		reg:                  map[string]*types.Sandbox{},
+		envdInitFP:           map[string]string{},
 		lifecycleCtx:         context.Background(),
 		deadlineIntents:      map[string]struct{}{},
 		subs:                 map[int]chan routesync.Event{},
@@ -3160,6 +3167,7 @@ func (o *Orchestrator) uncache(id string) {
 	o.mu.Lock()
 	delete(o.reg, id)
 	o.mu.Unlock()
+	o.forgetEnvdInit(id)
 }
 func (o *Orchestrator) lookup(id string) *types.Sandbox {
 	o.mu.Lock()
@@ -3402,8 +3410,8 @@ func (o *Orchestrator) envdInit(ctx context.Context, sb *types.Sandbox) error {
 	for failures := 0; ; failures++ {
 		payload := map[string]any{
 			"envVars":        sb.Env,
-			"defaultUser":    "user",
-			"defaultWorkdir": "/home/user",
+			"defaultUser":    envdDefaultUser,
+			"defaultWorkdir": envdDefaultWorkdir,
 			"timestamp":      time.Now().UTC().Format(time.RFC3339),
 		}
 		if o.cfg.MMDS.Enabled {
