@@ -403,11 +403,21 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	lp.Dur("tail.workspace_bind", tBinds)
 	if tmpl.Profile == types.ProfileE2B {
 		envdStarted := time.Now()
-		err = o.envdInit(launchCtx, sb)
-		o.logLaunchPhase(attempt, sb, "envd_init_duration", time.Since(envdStarted))
-		lp.Dur("tail.envd_init", envdStarted)
-		if err != nil {
-			return launchFailed("init", err)
+		fingerprint := envdInitFingerprint(sb, o.cfg.MMDS.Enabled)
+		// Only an identity-preserving resume can reuse the previous /init.
+		// Create/fork has a new EnvdAccessToken and possibly new env; a changed
+		// env/token/MMDS posture changes the fingerprint, so /init still runs.
+		if attempt.Kind() == launchResume && o.envdInitWasApplied(sb.ID, fingerprint) {
+			o.logLaunchPhase(attempt, sb, "envd_init_skipped_duration", 0)
+			lp.Dur("tail.envd_init_skipped", envdStarted)
+		} else {
+			err = o.envdInit(launchCtx, sb)
+			o.logLaunchPhase(attempt, sb, "envd_init_duration", time.Since(envdStarted))
+			lp.Dur("tail.envd_init", envdStarted)
+			if err != nil {
+				return launchFailed("init", err)
+			}
+			o.markEnvdInit(sb.ID, fingerprint)
 		}
 	}
 
